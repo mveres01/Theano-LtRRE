@@ -42,16 +42,16 @@ class MemoryModule(object):
         else:
             assert np.allclose(np.sum(K**2, axis=1), np.ones(K.shape[0])), \
                    'The rows of K must be unit norm'
+        self.K = theano.shared(K, name='keys')
 
         if V is None:
             V = np.ones(mem_size, dtype=theano.config.floatX)*-1
+        self.V = theano.shared(V, name='values')
+
         if A is None:
             A = np.zeros(mem_size, dtype=theano.config.floatX)
-
-        # Memory keys (K), Values (V), and Ages (A)
-        self.K = theano.shared(K, name='keys')
-        self.V = theano.shared(V, name='values')
         self.A = theano.shared(A, name='ages')
+
 
     def _neighbours(self, query):
         """Returns the labels and similarities between keys in memory and query.
@@ -65,25 +65,21 @@ class MemoryModule(object):
         # Reshape the tensors for broadcasting and calculate cosine similarity
         q = query.dimshuffle(0, 'x', 1) # (n_query, 1, key_size)
         M = self.K.dimshuffle('x', 0, 1) # (1, memory_size, key_size)
-        cosine_sim = T.sum(q*M, axis=2) # (n_query, memory_size)
+        similarity = T.sum(q*M, axis=2) # (n_query, memory_size)
 
         # Find the k-nearest neighbours in terms of cosine similarity.
-        k_nearest = T.argsort(cosine_sim, axis=1) # Ascending order
-        k_nearest = k_nearest[:, ::-1][:, :self.k_nbrs] # Descending order
+        k_nbrs = T.argsort(similarity, axis=1)[:, ::-1][:, :self.k_nbrs]
 
-        # Find the calculated cosine similarity for the nearest neighbours
-        # Note that repeats formats as: ([0]**n_queries, ... [n-1]*n_queries)
+        # Index the labels & similarity matrix to get values for each neighbour
+        # NOTE: repeats formatsa list as: ([0]**n_queries, ... [n-1]*n_queries)
         idx = T.extra_ops.repeat(T.arange(n_queries), self.k_nbrs)
-        k_similar = cosine_sim[idx, k_nearest.flatten()]
-        k_similar = k_similar.reshape(k_nearest.shape)
+        k_nbrs_y = self.V[k_nbrs.flatten()].reshape(k_nbrs.shape)
+        k_nbrs_sim = similarity[idx, k_nbrs.flatten()].reshape(k_nbrs.shape)
 
-        # Find the label of the closest neighbour for each query
-        k_labels = self.V[k_nearest.flatten()].reshape(k_nearest.shape)
+        # Return the indices, labels, and cosine similarity
+        return k_nbrs, k_nbrs_y, k_nbrs_sim
 
-        # Return the indices, labels at the indices, cosine similarity at indices
-        return k_nearest, k_labels, k_similar
-
-    def _loss(self, nbrs, nbrs_labels, query, query_labels):
+    def _loss(self, nbrs, nbrs_y, query, query_y):
         """Builds a theano graph for computing memory module loss.
 
         TODO: In scan_fn, when accessing memory for a sample with the same label
@@ -96,7 +92,7 @@ class MemoryModule(object):
         CONST_TRUE = T.constant(1.0, dtype='int32')
         CONST_FALSE = T.constant(0.0, dtype='int32')
 
-        def scan_fn(nbrs_idx, nbrs_y, query_y):
+        def scan_fn(idx):
             """Returns the positive and negative sample for a query."""
 
             def get_sample_idx(compare_op):
@@ -104,8 +100,8 @@ class MemoryModule(object):
                 assert compare_op in [T.eq, T.neq]
 
                 # See if the neighbours contain a label, if not check memory
-                nbr_match = compare_op(nbrs_y, query_y)
-                mem_match = compare_op(self.V, query_y)
+                nbr_match = compare_op(nbrs_y[idx], query_y[idx])
+                mem_match = compare_op(self.V, query_y[idx])
 
                 # Whether a matching sample can be found in neighbours or memory
                 mask = ifelse(T.any(nbr_match), CONST_TRUE,
@@ -117,7 +113,7 @@ class MemoryModule(object):
                 imem = int32x(mem_match.nonzero()[0][0])
 
                 # Whether the match is found in the neighbours or memory
-                match = ifelse(T.any(nbr_match), int32x(nbrs_idx[inbr]),
+                match = ifelse(T.any(nbr_match), int32x(nbrs[idx, inbr]),
                          ifelse(T.any(mem_match), imem, CONST_FALSE))
 
                 return match, mask
@@ -129,7 +125,7 @@ class MemoryModule(object):
 
 
         results, updates = theano.scan(scan_fn,
-                    sequences=[nbrs, nbrs_labels, query_labels])
+                    sequences=[T.arange(query_y.shape[0])])
 
         pos_idx, neg_idx, pos_mask, neg_mask = results
 
@@ -143,7 +139,7 @@ class MemoryModule(object):
 
         return loss
 
-    def _update(self, nbrs, nbrs_labels, query, query_label):
+    def _update(self, nbrs, nbrs_y, query, query_y):
         """Builds a graph for performing updates to memory module.
 
         Two different kinds of updates can be performed, which depend on the
@@ -163,7 +159,7 @@ class MemoryModule(object):
 
         # Condition (1)
         # Note that we need the slice to force an (n x 1) matrix for comparison
-        correct_query = T.eq(nbrs_labels[:, 0:1], query_label).nonzero()[0]
+        correct_query = T.eq(nbrs_y[:, 0], query_y).nonzero()[0]
         correct_memory = nbrs[correct_query, 0] # Idx to memory keys
 
         normed_keys = tensor_norm(query[correct_query] + new_K[correct_memory])
@@ -172,7 +168,7 @@ class MemoryModule(object):
 
         # Condition (2)
         # Find where the first returned neighbour does not share query label
-        incorrect_mask = T.neq(nbrs_labels[:, 0:1], query_label)
+        incorrect_mask = T.neq(nbrs_y[:, 0], query_y)
         incorrect_query = incorrect_mask.nonzero()[0]
         incorrect_memory = nbrs[incorrect_query, 0]
 
@@ -184,9 +180,8 @@ class MemoryModule(object):
         oldest_idx = T.argsort(age_mask*noise)[::-1] # sorted decreasing
         oldest_idx = oldest_idx[:T.sum(incorrect_mask)]
 
-        # Note that query_label is reshaped to an (n x 1) matrix
         new_K = T.set_subtensor(new_K[incorrect_memory], query[incorrect_query])
-        new_V = T.set_subtensor(new_V[incorrect_memory], query_label[incorrect_query, 0])
+        new_V = T.set_subtensor(new_V[incorrect_memory], query_y[incorrect_query])
         new_A = T.set_subtensor(new_A[incorrect_memory], 0.)
 
         # Increment the age of all non-updated indices by 1
@@ -197,20 +192,17 @@ class MemoryModule(object):
 
         return [(self.K, new_K), (self.V, new_V), (self.A, new_A)]
 
-    def build_loss_and_updates(self, query, query_labels):
+    def build_loss_and_updates(self, query, query_y):
 
         # Find the labels and similarity of a query vector to memory
         normed_query = tensor_norm(query)
 
-        if query_labels.ndim == 1:
-            query_labels = T.reshape(query_labels, (-1, 1))
-
         # Find the labels and similarity of a query vector to memory
-        nbrs, nbrs_labels, _ = self._neighbours(normed_query)
+        nbrs, nbrs_y, _ = self._neighbours(normed_query)
 
         # Build the graph for computing loss updates to shared memory
-        loss = self._loss(nbrs, nbrs_labels, normed_query, query_labels)
-        updates = self._update(nbrs, nbrs_labels, normed_query, query_labels)
+        loss = self._loss(nbrs, nbrs_y, normed_query, query_y)
+        updates = self._update(nbrs, nbrs_y, normed_query, query_y)
 
         return loss, updates
 
@@ -303,7 +295,7 @@ def main():
             inputs, targets = batch
 
             pred_loss = train_fn(inputs, targets)
-
+            print 'Loss: %2.4f'%pred_loss.mean()
 
         print 'Memory in use: ', np.sum(memory.A.get_value() < np.max(memory.A.get_value()))
         unique = list(set(memory.A.get_value()))
