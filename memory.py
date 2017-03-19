@@ -21,8 +21,8 @@ class MemoryModule(object):
     """Implements a memory module using theano.
 
     Note: It is important that every key is initialized differently.
-          If initialized as all 0's, 1's, etc ... the module will be unable
-          to calculate nearest neighbours properly
+          If all keys have the same unit norm, the module will fail to update
+          properly as each query will produce the same nearest neighbours.
     """
 
     def __init__(self, mem_size, key_size, k_nbrs, alpha=0.1, t=40, seed=1234,
@@ -257,10 +257,10 @@ def main():
     # Learning
     batch_size = 50 # Note, also controls age of memory
     num_epochs = 50
-    n_samples = 10000
+    n_samples = 1000
 
     # Memory
-    memory_size = 10000
+    memory_size = 1000
     key_size = n_features
     k_nbrs = 5
 
@@ -284,7 +284,7 @@ def main():
     query_var = T.matrix('query_var')
     query_target = T.ivector('query_target')
 
-    memory = MemoryModule(memory_size, key_size, k_nbrs, K=k)
+    memory = MemoryModule(memory_size, key_size, k_nbrs)
     loss, updates = memory.build_loss_and_updates(query_var, query_target)
 
     # Compile theano functions to test graph
