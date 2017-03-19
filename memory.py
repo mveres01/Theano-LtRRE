@@ -1,16 +1,18 @@
 import os
 import sys
+from collections import OrderedDict
+
 import numpy as np
 import theano
 import theano.tensor as T
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from theano.ifelse import ifelse
 
-def tensor_norm(X, keepdims=True):
-    return X / T.sqrt(T.sum(X**2, axis=1, keepdims=keepdims))
+def tensor_norm(X, eps=1e-8, keepdims=True):
+    return X / (T.sqrt(T.sum(X**2, axis=1, keepdims=keepdims)) + eps)
 
-def norm(X, keepdims=True):
-    return X / np.sqrt(np.sum(X**2, axis=1, keepdims=keepdims))
+def norm(X, eps=1e-8, keepdims=True):
+    return X / (np.sqrt(np.sum(X**2, axis=1, keepdims=keepdims)) + eps)
 
 def int32x(x):
     return T.cast(x, 'int32')
@@ -21,6 +23,9 @@ class MemoryModule(object):
     Note: It is important that every key is initialized differently.
           If all keys have the same unit norm, the module will fail to update
           properly as each query will produce the same nearest neighbours.
+    Note: When training with neural networks, make sure that the size of memory
+          is larger then the batch size, or this module will throw an error when
+          trying find too many indexs' to memory.
     """
 
     def __init__(self, mem_size, key_size, k_nbrs, alpha=0.1, t=40, seed=1234,
@@ -89,35 +94,35 @@ class MemoryModule(object):
         CONST_TRUE = T.constant(1.0, dtype='int32')
         CONST_FALSE = T.constant(0.0, dtype='int32')
 
+        def get_sample_idx(idx, compare_op):
+            """Computes EITHER positive or negative for a query."""
+
+            assert compare_op in [T.eq, T.neq]
+
+            # See if the neighbours contain a label, if not check memory
+            nbr_match = compare_op(nbrs_y[idx], query_y[idx])
+            mem_match = compare_op(self.V, query_y[idx])
+
+            # Whether a matching sample can be found in neighbours or memory
+            mask = ifelse(T.any(nbr_match), CONST_TRUE,
+                          ifelse(T.any(mem_match), CONST_TRUE, CONST_FALSE))
+
+            # An index to the full memory (using either a retrieved
+            # neighbour, or random sample in memory) of a matching sample
+            inbr = int32x(nbr_match.nonzero()[0][0])
+            imem = int32x(mem_match.nonzero()[0][0])
+
+            # Whether the match is found in the neighbours or memory
+            match = ifelse(T.any(nbr_match), int32x(nbrs[idx, inbr]),
+                           ifelse(T.any(mem_match), imem, CONST_FALSE))
+
+            return match, mask
+
         def scan_fn(idx):
             """Returns the positive AND negative sample for a query."""
 
-            def get_sample_idx(compare_op):
-                """Computes EITHER positive or negative for a query."""
-
-                assert compare_op in [T.eq, T.neq]
-
-                # See if the neighbours contain a label, if not check memory
-                nbr_match = compare_op(nbrs_y[idx], query_y[idx])
-                mem_match = compare_op(self.V, query_y[idx])
-
-                # Whether a matching sample can be found in neighbours or memory
-                mask = ifelse(T.any(nbr_match), CONST_TRUE,
-                              ifelse(T.any(mem_match), CONST_TRUE, CONST_FALSE))
-
-                # An index to the full memory (using either a retrieved
-                # neighbour, or random sample in memory) of a matching sample
-                inbr = int32x(nbr_match.nonzero()[0][0])
-                imem = int32x(mem_match.nonzero()[0][0])
-
-                # Whether the match is found in the neighbours or memory
-                match = ifelse(T.any(nbr_match), int32x(nbrs[idx, inbr]),
-                               ifelse(T.any(mem_match), imem, CONST_FALSE))
-
-                return match, mask
-
-            pos_idx, pos_mask = get_sample_idx(T.eq)
-            neg_idx, neg_mask = get_sample_idx(T.neq)
+            pos_idx, pos_mask = get_sample_idx(idx, T.eq)
+            neg_idx, neg_mask = get_sample_idx(idx, T.neq)
 
             return (pos_idx, neg_idx, pos_mask, neg_mask)
 
@@ -131,7 +136,7 @@ class MemoryModule(object):
         neg_loss = T.sum(query*self.K[neg_idx]*neg_mask, axis=1)
 
         # Relu trick taken from TF implementation
-        return T.nnet.relu(neg_loss - pos_loss + self.alpha) - self.alpha
+        return T.nnet.relu(neg_loss - pos_loss + self.alpha)
 
     def _update(self, nbrs, nbrs_y, query, query_y):
         """Builds a graph for performing updates to memory module.
@@ -141,6 +146,7 @@ class MemoryModule(object):
 
         Case 1) If V[n_1] == q, update the key by taking the average of the
                 current key and q, and normalizing it.
+
         Case 2) If V[n_1] != q, find memory items with maximum age, and write
                 to one of them (randomly chosen)
 
@@ -157,7 +163,7 @@ class MemoryModule(object):
 
         normed_keys = tensor_norm(query[correct_query] + new_K[correct_memory])
         new_K = T.set_subtensor(new_K[correct_memory], normed_keys)
-        new_A = T.set_subtensor(new_A[correct_memory], 0)
+        new_A = T.set_subtensor(new_A[correct_memory], 0.)
 
         # Condition (2): First returned neighbour does not share query label.
         # Add the key and label from query to memory
@@ -178,11 +184,11 @@ class MemoryModule(object):
 
         # Increment the age of all non-updated indices by 1
         update_mask = T.ones_like(new_A, dtype=theano.config.floatX)
-        update_mask = T.set_subtensor(update_mask[correct_memory], 0)
-        update_mask = T.set_subtensor(update_mask[oldest_idx], 0)
+        update_mask = T.set_subtensor(update_mask[correct_memory], 0.)
+        update_mask = T.set_subtensor(update_mask[oldest_idx], 0.)
         new_A = new_A + update_mask
 
-        return [(self.K, new_K), (self.V, new_V), (self.A, new_A)]
+        return OrderedDict([(self.K, new_K), (self.V, new_V), (self.A, new_A)])
 
     def build_loss_and_updates(self, query, query_y):
         """Builds theano graphs for loss and updates to memory."""
@@ -193,7 +199,7 @@ class MemoryModule(object):
         nbrs, nbrs_y, _ = self._neighbours(normed_query)
 
         # Build the graph for computing loss updates to shared memory
-        loss = self._loss(nbrs, nbrs_y, normed_query, query_y)
+        loss = self._loss(nbrs, nbrs_y, normed_query, query_y).mean()
         updates = self._update(nbrs, nbrs_y, normed_query, query_y)
 
         return loss, updates
@@ -266,12 +272,19 @@ def main():
     query_var = T.matrix('query_var')
     query_target = T.ivector('query_target')
 
+
+
     memory = MemoryModule(memory_size, key_size, k_nbrs)
     loss, updates = memory.build_loss_and_updates(query_var, query_target)
+    query_lbls, query_sim = memory.query(query_var)
 
     # Compile theano functions to test graph
     train_fn = theano.function([query_var, query_target], loss, updates=updates,
                                allow_input_downcast=True)
+
+    query_fn = theano.function([query_var], [query_lbls, query_sim], allow_input_downcast=True)
+
+    #sys.exit(1)
 
     print "Starting training..."
     for _ in range(num_epochs):
@@ -280,12 +293,18 @@ def main():
             inputs, targets = batch
 
             pred_loss = train_fn(inputs, targets)
-            print 'Loss: %2.4f'%pred_loss.mean()
+
+            labels, sim = query_fn(inputs)
+
+            print 'Query_labels:   \n', labels[:5]
+            print 'y_train labels: \n', targets[:5]
+            print np.allclose(labels, targets[:50])
+
 
     used_memory_mask = memory.V.get_value() != -1
     unused_memory_mask = memory.V.get_value() == -1
-    print 'Percentage of used memory:    ', float(np.sum(used_memory_mask)) / float(memory_size)
-    print 'Percentage of un-used memory: ', float(np.sum(unused_memory_mask)) / float(memory_size)
+    print 'Percentage of used memory:    %2.6f'%(float(np.sum(used_memory_mask)) / float(memory_size))
+    print 'Percentage of un-used memory: %2.6f'%(float(np.sum(unused_memory_mask)) / float(memory_size))
 
 
     import matplotlib.pyplot as plt
