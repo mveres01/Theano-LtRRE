@@ -8,11 +8,42 @@ import theano.tensor as T
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from theano.ifelse import ifelse
 
+def norm(X, eps=1e-8, keepdims=True):
+    return X / (np.sqrt(np.sum(X**2, axis=1, keepdims=keepdims)) + eps)
+
 def tensor_norm(X, eps=1e-8, keepdims=True):
     return X / (T.sqrt(T.sum(X**2, axis=1, keepdims=keepdims)) + eps)
 
-def norm(X, eps=1e-8, keepdims=True):
-    return X / (np.sqrt(np.sum(X**2, axis=1, keepdims=keepdims)) + eps)
+def tensor_choose_k(boolean_mask, rng, k=1, random=False):
+    """Selects an element from each row of boolean_mask.
+  
+    Parameters
+    ----------
+    boolean_mask: 2d Boolean matrix, where rows are samples and columns are
+        possible choices.
+    rng: An instance of theano.sandbox.rng_mrg.MRG_RandomStreams
+    k (int): Number of samples we choose
+    random: Boolean flag indicating whether to select 'k' indices in order 
+        (random=False), or whether to randomly choose 'k' indices
+        (randome=True).
+    """
+    mask = boolean_mask
+    if mask.ndim > 2:
+        raise Exception('Input tensor must be either 1d or 2d.')
+    elif mask.ndim == 1:
+        mask = mask.dimshuffle('x', 0)
+
+    assert T.lt(k, mask.shape[1]), 'k must be leq number of possible choices'
+
+    if random is True:
+        noise = rng.uniform(mask.shape, low=0, high=mask.shape[1])
+    else:
+        noise = (1 + T.arange(mask.shape[1]))[::-1] # Descending order
+        noise = noise.dimshuffle('x', 0)
+   
+    if k == 1:
+        return T.argmax(mask*noise, axis=1)
+    return T.argsort(mask*noise, axis=1)[:, ::-1][:, :k]
 
 class MemoryModule(object):
     """Implements a memory module using theano.
@@ -26,7 +57,7 @@ class MemoryModule(object):
     """
 
     def __init__(self, mem_size, key_size, k_nbrs, alpha=0.1, t=40, seed=1234,
-                 K=None, V=None, A=None):
+                 C=3, K=None, V=None, A=None):
 
         assert k_nbrs <= mem_size, 'k_nbrs must be less then (or equal) mem size'
 
@@ -35,6 +66,7 @@ class MemoryModule(object):
         self.k_nbrs = k_nbrs
         self.alpha = alpha
         self.t = t # Softmax temperature
+        self.C = C # Threshold for sampling mamx ages during update
         self.rng = RandomStreams(seed=seed)
 
         if K is None:
@@ -46,12 +78,22 @@ class MemoryModule(object):
         self.K = theano.shared(K, name='keys')
 
         if V is None:
-            V = np.ones(mem_size, dtype=theano.config.floatX)*-1
+            V = np.ones(mem_size, dtype='int32')*-1
         self.V = theano.shared(V, name='values')
 
         if A is None:
             A = np.zeros(mem_size, dtype=theano.config.floatX)
         self.A = theano.shared(A, name='ages')
+
+    def _format_query(self, query):
+        """Convenience function for formatting query vector / matrix."""
+
+        assert T.le(query.ndim, 2), 'Query must either be 1d (single '\
+                                       'sample) or a 2d matrix where rows'\
+                                       'correspond to different samples.'
+        if query.ndim == 1:
+            return tensor_norm(query.dimshuffle('x', 0))
+        return tensor_norm(query)
 
     def _neighbours(self, query):
         """Returns the labels and similarities between keys in memory and query.
@@ -77,60 +119,49 @@ class MemoryModule(object):
         k_nbrs_sim = similarity[idx, k_nbrs.flatten()].reshape(k_nbrs.shape)
 
         return k_nbrs, k_nbrs_y, k_nbrs_sim
-
     
     def _loss(self, nbrs, nbrs_y, query, query_y):
-        """Builds a theano graph for computing memory module loss.
+        """Builds a theano graph for computing memory triplet loss."""
 
-        TODO: Check if we need to supply 'updates' to the train function, 
-              so T.set_subtensor actually computes the values.
-        """
+        def get_idx(q_nbrs, q_mem):
+            """Gets the index of sample in memory for computing loss.
 
-        def random_select(idx_mask):
-            """Randomly selects a matching value from idx_max (2d matrix)."""
+            We first look to see if the query label can be found in the 
+            retrieved neighbours, and if not, look to memory for a key with
+            the same value.
 
-            noise = self.rng.uniform((idx_mask.shape), 0, idx_mask.shape[1])
-            return T.argmax(idx_mask*noise, axis=1)
-
-        def get_idx(q_nbrs, q_memory):
+            We keep track of a boolean mask, which indices whether or not we
+            were able to find a sample with a label that matches the query.
+            """
 
             # Whether a matching sample can be found in neighbours or memory
-            match_in_nbrs = T.any(q_nbrs, axis=1)
-            match_in_memory = T.any(q_memory, axis=1)
-            match_in_anything = (match_in_nbrs + match_in_memory) > 0
-            
-            # Used to update subtensor
-            mask = match_in_anything.nonzero()[0] # indices
+            any_match_nbrs = T.any(q_nbrs, axis=1)
+            any_match_mem = T.any(q_mem, axis=1)
+            any_match = T.or_(any_match_nbrs, any_match_mem)
 
-            idx = T.switch(match_in_nbrs, nbrs[:, random_select(q_nbrs)], 
-                                          random_select(q_memory))
+            # Look in neighbours then memory for corresponding sample.
+            # If from neighbours, we need to retrieve the full mem idx.
+            rows = T.arange(nbrs.shape[0])
+            idx = T.switch(any_match_nbrs, 
+                           nbrs[rows, tensor_choose_k(q_nbrs, self.rng, k=1)], 
+                           tensor_choose_k(q_mem, self.rng, k=1, random=True))
 
-            # We'll construct a full tensor, but only populate with valid idx
-            idx_tensor = T.zeros_like(query_y, dtype='int32')
-            idx_tensor = T.inc_subtensor(idx_tensor[mask], idx[mask, 0])
+            return (idx, any_match)
 
-            return idx_tensor, match_in_anything
-
-
-        # First check whether we have a match in retrieved neighbours or memory 
+        # Make the labels broadcastable for indexing
         query_y_2d = T.reshape(query_y, (-1, 1))
 
-        query_in_nbrs = T.eq(nbrs_y, query_y_2d)
-        query_in_memory = T.eq(query_y_2d, T.reshape(self.V, (1, -1)))
-        pos_idx, pos_mask = get_idx(query_in_nbrs, query_in_memory)
+        query_in_nbrs = T.eq(query_y_2d, nbrs_y) #(n_queries, self.k_nbrs)
+        query_in_mem = T.eq(query_y_2d, T.reshape(self.V, (1, -1)))
 
-        query_not_in_nbrs = T.neq(nbrs_y, query_y_2d)
-        query_not_in_memory = T.neq(query_y_2d, T.reshape(self.V, (1, -1)))
-        neg_idx, neg_mask = get_idx(query_not_in_nbrs, query_not_in_memory)
+        positive = get_idx(query_in_nbrs, query_in_mem)
+        pos_loss = T.sum(query*self.K[positive[0]], axis=1)*positive[1]
 
-        pos_mask = pos_mask.dimshuffle(0, 'x')
-        pos_loss = T.sum(query*self.K[pos_idx]*pos_mask, axis=1)
+        negative = get_idx(T.invert(query_in_nbrs), T.invert(query_in_mem))
+        neg_loss = T.sum(query*self.K[negative[0]], axis=1)*negative[1]
 
-        neg_mask = neg_mask.dimshuffle(0, 'x')
-        neg_loss = T.sum(query*self.K[neg_idx]*neg_mask, axis=1)
-
-        # Relu trick taken from TF implementation
-        return T.nnet.relu(neg_loss - pos_loss + self.alpha)
+        # Only return the positive components
+        return T.maximum(0, neg_loss - pos_loss + self.alpha)
 
 
     def _update(self, nbrs, nbrs_y, query, query_y):
@@ -154,11 +185,11 @@ class MemoryModule(object):
 
         # Condition (1): First returned neighbour shares the same query label
         correct_query = T.eq(nbrs_y[:, 0], query_y).nonzero()[0]
-        correct_memory = nbrs[correct_query, 0] # Idx to memory keys
+        correct_mem = nbrs[correct_query, 0] # Idx to memory keys
 
-        normed_keys = tensor_norm(query[correct_query] + new_K[correct_memory])
-        new_K = T.set_subtensor(new_K[correct_memory], normed_keys)
-        new_A = T.set_subtensor(new_A[correct_memory], 0.)
+        normed_keys = tensor_norm(query[correct_query] + new_K[correct_mem])
+        new_K = T.set_subtensor(new_K[correct_mem], normed_keys)
+        new_A = T.set_subtensor(new_A[correct_mem], 0.)
 
         # Condition (2): First returned neighbour does not share query label.
         # Add the key and label from query to memory
@@ -167,11 +198,10 @@ class MemoryModule(object):
 
         # We need to find len(incorrect_query) locations in memory to write to.
         # Noise is added to randomize selection.
-        age_mask = T.eq(new_A, T.max(new_A)) # e.g. [True, False ... True]
-        noise = self.rng.uniform((self.mem_size, ), 0, self.mem_size)
-
-        oldest_idx = T.argsort(age_mask*noise)[::-1] # sorted decreasing
-        oldest_idx = oldest_idx[:T.sum(incorrect_mask)]
+        age_mask = T.ge(new_A, T.max(new_A) - self.C)
+        oldest_idx = tensor_choose_k(age_mask, self.rng, 
+                                     k=T.sum(incorrect_mask), 
+                                     random=True)
 
         new_K = T.set_subtensor(new_K[oldest_idx], query[incorrect_query])
         new_V = T.set_subtensor(new_V[oldest_idx], query_y[incorrect_query])
@@ -179,22 +209,22 @@ class MemoryModule(object):
 
         # Increment the age of all non-updated indices by 1
         update_mask = T.ones_like(new_A, dtype=theano.config.floatX)
-        update_mask = T.set_subtensor(update_mask[correct_memory], 0.)
+        update_mask = T.set_subtensor(update_mask[correct_mem], 0.)
         update_mask = T.set_subtensor(update_mask[oldest_idx], 0.)
         new_A = new_A + update_mask
 
-        return OrderedDict([(self.K, new_K), (self.V, new_V), (self.A, new_A)])
+        return {(self.K, new_K), (self.V, new_V), (self.A, new_A)}
 
     def build_loss_and_updates(self, query, query_y):
         """Builds theano graphs for loss and updates to memory."""
 
-        normed_query = tensor_norm(query)
+        normed_query = self._format_query(query)
 
         # Find the labels and similarity of a query vector to memory
         nbrs, nbrs_y, _ = self._neighbours(normed_query)
 
-        # Build the graph for computing loss updates to shared memory
-        loss = self._loss(nbrs, nbrs_y, normed_query, query_y).mean()
+        # Build the graph for computing loss and updates to shared memory
+        loss = self._loss(nbrs, nbrs_y, normed_query, query_y)
         updates = self._update(nbrs, nbrs_y, normed_query, query_y)
 
         return loss, updates
@@ -203,7 +233,7 @@ class MemoryModule(object):
         """Queries the memory module for a label to a query."""
 
         # Normalize the query value.
-        normed_query = tensor_norm(query)
+        normed_query = self._format_query(query)
 
         # Find the labels and similarity of a query vector to memory
         _, labels, similarity = self._neighbours(normed_query)
@@ -238,11 +268,11 @@ def main():
 
     # Dataset
     n_features = 30
-    n_samples = 50000
+    n_samples = 500
 
     # Learning
     batch_size = 10 # Note, also controls age of memory
-    num_epochs = 50
+    num_epochs = 20
 
     # Memory
     memory_size = 100
@@ -267,11 +297,10 @@ def main():
     query_var = T.matrix('query_var')
     query_target = T.ivector('query_target')
 
-
-
     memory = MemoryModule(memory_size, key_size, k_nbrs)
     loss, updates = memory.build_loss_and_updates(query_var, query_target)
     query_lbls, query_sim = memory.query(query_var)
+
 
     # Compile theano functions to test graph
     train_fn = theano.function([query_var, query_target], loss, updates=updates,
@@ -286,16 +315,39 @@ def main():
     for epoch in range(num_epochs):
 
         start = time.time()
+        train_acc = 0
+        train_batches = 0
         # In each epoch, we do a full pass over the training data:
-        for batch in iterate_minibatches(X_train[:10], y_train[:10], batch_size, shuffle=True):
+        for batch in iterate_minibatches(X_train[:10], y_train[:10],
+                                         batchsize=10, shuffle=True):
             inputs, targets = batch
 
             pred_loss = train_fn(inputs, targets)
 
             labels, sim = query_fn(inputs)
+            train_acc += np.mean(labels == targets)
+            train_batches += 1 
+
+            print 'pred_loss: \n', pred_loss
+            print 'Targets:   \n', targets
+
+
+        valid_batches = 0
+        valid_acc = 0.
+        for batch in iterate_minibatches(X_val, y_val, batch_size, shuffle=False):
+            inputs, targets = batch
+
+            labels, sim = query_fn(inputs)
+
+            #print 'Valid labels: \n', targets
+            #print 'Predc labels: \n', labels
+
+            valid_acc += np.mean(labels == targets)
+            valid_batches += 1
 
         print 'Epoch %d took: %2.4fs'%(epoch, time.time() - start)
-
+        print '  Train Accuracy: %2.4f'%(train_acc / train_batches)
+        print '  Valid Accuracy: %2.4f'%(valid_acc / valid_batches)
 
     used_memory_mask = memory.V.get_value() != -1
     unused_memory_mask = memory.V.get_value() == -1
