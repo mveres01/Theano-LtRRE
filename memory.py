@@ -1,7 +1,5 @@
 import os
 import sys
-from collections import OrderedDict
-
 import numpy as np
 import theano
 import theano.tensor as T
@@ -33,7 +31,7 @@ def tensor_choose_k(boolean_mask, rng, k=1, random=False):
     elif mask.ndim == 1:
         mask = mask.dimshuffle('x', 0)
 
-    assert T.lt(k, mask.shape[1]), 'k must be leq number of possible choices'
+    assert T.lt(k, mask.shape[1]), 'k must be < then # of possible choices'
 
     if random is True:
         noise = rng.uniform(mask.shape, low=0, high=mask.shape[1])
@@ -82,15 +80,15 @@ class MemoryModule(object):
         self.V = theano.shared(V, name='values')
 
         if A is None:
-            A = np.zeros(mem_size, dtype=theano.config.floatX)
+            A = np.ones(mem_size, dtype=theano.config.floatX)*(C+1)
         self.A = theano.shared(A, name='ages')
 
     def _format_query(self, query):
         """Convenience function for formatting query vector / matrix."""
 
         assert T.le(query.ndim, 2), 'Query must either be 1d (single '\
-                                       'sample) or a 2d matrix where rows'\
-                                       'correspond to different samples.'
+                                    'sample) or a 2d matrix where rows'\
+                                    'correspond to different samples.'
         if query.ndim == 1:
             return tensor_norm(query.dimshuffle('x', 0))
         return tensor_norm(query)
@@ -130,7 +128,7 @@ class MemoryModule(object):
             retrieved neighbours, and if not, look to memory for a key with
             the same value.
 
-            We keep track of a boolean mask, which indices whether or not we
+            We keep track of a boolean mask, which indicates whether or not we
             were able to find a sample with a label that matches the query.
             """
 
@@ -159,10 +157,9 @@ class MemoryModule(object):
 
         negative = get_idx(T.invert(query_in_nbrs), T.invert(query_in_mem))
         neg_loss = T.sum(query*self.K[negative[0]], axis=1)*negative[1]
-
+    
         # Only return the positive components
         return T.maximum(0, neg_loss - pos_loss + self.alpha)
-
 
     def _update(self, nbrs, nbrs_y, query, query_y):
         """Builds a graph for performing updates to memory module.
@@ -220,7 +217,7 @@ class MemoryModule(object):
 
         normed_query = self._format_query(query)
 
-        # Find the labels and similarity of a query vector to memory
+        # Find the indices and labels of memory to a query
         nbrs, nbrs_y, _ = self._neighbours(normed_query)
 
         # Build the graph for computing loss and updates to shared memory
@@ -268,16 +265,16 @@ def main():
 
     # Dataset
     n_features = 30
-    n_samples = 500
+    n_samples = 25000
 
     # Learning
-    batch_size = 10 # Note, also controls age of memory
-    num_epochs = 20
+    batch_size = 50 # Note, also controls age of memory
+    num_epochs = 10
 
     # Memory
-    memory_size = 100
+    memory_size = 5000
     key_size = n_features
-    k_nbrs = 5
+    k_nbrs = 32
 
     X, y = datasets.make_classification(n_samples=n_samples, n_features=n_features,
                                         n_informative=5, n_redundant=3,
@@ -317,23 +314,24 @@ def main():
         start = time.time()
         train_acc = 0
         train_batches = 0
+        train_time = time.time()
+
         # In each epoch, we do a full pass over the training data:
-        for batch in iterate_minibatches(X_train[:10], y_train[:10],
-                                         batchsize=10, shuffle=True):
+        for batch in iterate_minibatches(X_train, y_train,
+                                         batch_size, shuffle=True):
             inputs, targets = batch
 
             pred_loss = train_fn(inputs, targets)
-
             labels, sim = query_fn(inputs)
+            
             train_acc += np.mean(labels == targets)
             train_batches += 1 
-
-            print 'pred_loss: \n', pred_loss
-            print 'Targets:   \n', targets
-
+        print '  Training took %2.4fs'%(time.time()-train_time)
 
         valid_batches = 0
         valid_acc = 0.
+        train_time = time.time()
+        
         for batch in iterate_minibatches(X_val, y_val, batch_size, shuffle=False):
             inputs, targets = batch
 
@@ -344,6 +342,7 @@ def main():
 
             valid_acc += np.mean(labels == targets)
             valid_batches += 1
+        print '  Validation took %2.4fs'%(time.time()-train_time)
 
         print 'Epoch %d took: %2.4fs'%(epoch, time.time() - start)
         print '  Train Accuracy: %2.4f'%(train_acc / train_batches)
