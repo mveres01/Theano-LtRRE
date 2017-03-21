@@ -80,7 +80,7 @@ class MemoryModule(object):
         self.V = theano.shared(V, name='values')
 
         if A is None:
-            A = np.ones(mem_size, dtype=theano.config.floatX)*(C+1)
+            A = np.ones(mem_size, dtype=theano.config.floatX)*100
         self.A = theano.shared(A, name='ages')
 
     def _format_query(self, query):
@@ -195,7 +195,7 @@ class MemoryModule(object):
 
         # We need to find len(incorrect_query) locations in memory to write to.
         # Noise is added to randomize selection.
-        age_mask = T.ge(new_A, T.max(new_A) - self.C)
+        age_mask = T.ge(new_A, T.max(new_A) - self.C) #1d
         oldest_idx = tensor_choose_k(age_mask, self.rng, 
                                      k=T.sum(incorrect_mask), 
                                      random=True)
@@ -205,10 +205,13 @@ class MemoryModule(object):
         new_A = T.set_subtensor(new_A[oldest_idx], 0.)
 
         # Increment the age of all non-updated indices by 1
-        update_mask = T.ones_like(new_A, dtype=theano.config.floatX)
-        update_mask = T.set_subtensor(update_mask[correct_mem], 0.)
-        update_mask = T.set_subtensor(update_mask[oldest_idx], 0.)
-        new_A = new_A + update_mask
+        #update_mask = T.ones_like(new_A, dtype=theano.config.floatX)
+        #update_mask = T.set_subtensor(update_mask[correct_mem], 0.)
+        #update_mask = T.set_subtensor(update_mask[oldest_idx], 0.)
+        #new_A = new_A + update_mask
+        new_A = new_A + 1.
+        new_A = T.inc_subtensor(new_A[correct_mem], -1.)
+        new_A = T.inc_subtensor(new_A[oldest_idx], -1.)
 
         return {(self.K, new_K), (self.V, new_V), (self.A, new_A)}
 
@@ -226,6 +229,20 @@ class MemoryModule(object):
 
         return loss, updates
 
+    def get_memory(self):
+        """Returns the current stored memory."""
+        return self.K.get_value(), self.V.get_value(), self.A.get_value()
+
+    def set_memory(self, K, V, A):
+        """Sets the current memory."""
+        assert all(s.shape[0] == self.mem_size for s in [K, V, A]), \
+               'Keys, values and ages must all have %d samples.'%self.mem_size
+        if not np.allclose(np.sum(K**2, axis=1), np.ones(K.shape[0])):
+                raise ValueError('The rows of K must be unit norm')
+        self.K.set_value(K)
+        self.V.set_value(V)
+        self.A.set_value(A)
+        
     def query(self, query):
         """Queries the memory module for a label to a query."""
 
@@ -305,6 +322,18 @@ def main():
 
     query_fn = theano.function([query_var], [query_lbls, query_sim], allow_input_downcast=True)
 
+    # We can query and update memory at the same time, withouot calculating loss
+    update_fn = theano.function([query_var, query_target], 
+                                [query_lbls, query_sim], updates=updates,
+                                allow_input_downcast=True)
+
+
+    k, v, a = memory.get_memory()
+    k = norm(k + 1)
+    memory.set_memory(k, v, a)
+    print 'mem[:5]: \n', memory.K.get_value()[:5, :5]
+    print 'k[:5]: \n', k[:5, :5]
+
     #sys.exit(1)
 
     import time
@@ -326,7 +355,6 @@ def main():
             
             train_acc += np.mean(labels == targets)
             train_batches += 1 
-        print '  Training took %2.4fs'%(time.time()-train_time)
 
         valid_batches = 0
         valid_acc = 0.
@@ -336,13 +364,8 @@ def main():
             inputs, targets = batch
 
             labels, sim = query_fn(inputs)
-
-            #print 'Valid labels: \n', targets
-            #print 'Predc labels: \n', labels
-
             valid_acc += np.mean(labels == targets)
             valid_batches += 1
-        print '  Validation took %2.4fs'%(time.time()-train_time)
 
         print 'Epoch %d took: %2.4fs'%(epoch, time.time() - start)
         print '  Train Accuracy: %2.4f'%(train_acc / train_batches)
