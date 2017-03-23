@@ -1,30 +1,41 @@
+"""
+Note: Can we index arays with 2d filters (e.g. learned, high-level conv 
+       features or object representations?)
+"""
 import os
 import sys
 import numpy as np
+
+from collections import  OrderedDict
+
 import theano
 import theano.tensor as T
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from theano.ifelse import ifelse
 
+
 def norm(X, eps=1e-8, keepdims=True):
     return X / (np.sqrt(np.sum(X**2, axis=1, keepdims=keepdims)) + eps)
+
 
 def tensor_norm(X, eps=1e-8, keepdims=True):
     return X / (T.sqrt(T.sum(X**2, axis=1, keepdims=keepdims)) + eps)
 
+
 def tensor_choose_k(boolean_mask, rng, k=1, random=False):
-    """Selects an element from each row of boolean_mask.
+    """Selects k elements from each row of boolean_mask.
   
     Parameters
     ----------
-    boolean_mask: 2d Boolean matrix, where rows are samples and columns are
-        possible choices.
+    boolean_mask: A 2d Boolean matrix 
+      Each row is a sample, and each column with True is a possible choice
     rng: An instance of theano.sandbox.rng_mrg.MRG_RandomStreams
-    k (int): Number of samples we choose
+    k: An integer denoting the number of samples to choose
     random: Boolean flag indicating whether to select 'k' indices in order 
         (random=False), or whether to randomly choose 'k' indices
         (randome=True).
     """
+
     mask = boolean_mask
     if mask.ndim > 2:
         raise Exception('Input tensor must be either 1d or 2d.')
@@ -43,19 +54,18 @@ def tensor_choose_k(boolean_mask, rng, k=1, random=False):
         return T.argmax(mask*noise, axis=1)
     return T.argsort(mask*noise, axis=1)[:, ::-1][:, :k]
 
+
 class MemoryModule(object):
     """Implements a memory module using theano.
 
-    Note: It is important that every key is initialized differently.
-          If all keys have the same unit norm, the module will fail to update
-          properly as each query will produce the same nearest neighbours.
+    Note: Assumes initial class labels of -1
     Note: When training with neural networks, make sure that the size of memory
           is larger then the batch size, or this module will throw an error when
           trying find too many indexs' to memory.
     """
 
-    def __init__(self, mem_size, key_size, k_nbrs, alpha=0.1, t=40, seed=1234,
-                 C=3, K=None, V=None, A=None):
+    def __init__(self, mem_size, key_size, k_nbrs, alpha=0.1, t=40, C=3,
+                 seed=1234, K=None, V=None, A=None):
 
         assert k_nbrs <= mem_size, 'k_nbrs must be less then (or equal) mem size'
 
@@ -68,27 +78,27 @@ class MemoryModule(object):
         self.rng = RandomStreams(seed=seed)
 
         if K is None:
-            K = norm(np.random.randn(mem_size, key_size))
-            K = K.astype(theano.config.floatX)
-        else:
-            if not np.allclose(np.sum(K**2, axis=1), np.ones(K.shape[0])):
-                raise ValueError('The rows of K must be unit norm')
+            K = np.random.randn(mem_size, key_size)
+            K = norm(K).astype(theano.config.floatX)
+        assert np.allclose(np.sum(K**2, axis=1), 1.), \
+            'Supplied K must be unit norm.'
         self.K = theano.shared(K, name='keys')
 
         if V is None:
-            V = np.ones(mem_size, dtype='int32')*-1
+            V = np.full(mem_size, -1, dtype='int32')
         self.V = theano.shared(V, name='values')
 
         if A is None:
-            A = np.ones(mem_size, dtype=theano.config.floatX)*100
+            A = np.full(mem_size, C+1, dtype=theano.config.floatX)
         self.A = theano.shared(A, name='ages')
 
     def _format_query(self, query):
         """Convenience function for formatting query vector / matrix."""
 
-        assert T.le(query.ndim, 2), 'Query must either be 1d (single '\
-                                    'sample) or a 2d matrix where rows'\
-                                    'correspond to different samples.'
+        if not T.le(query.ndim, 2):
+            raise ValueError('Query must either be 1d (single sample) or a '\
+                             '2d matrix where rows are different samples.')
+
         if query.ndim == 1:
             return tensor_norm(query.dimshuffle('x', 0))
         return tensor_norm(query)
@@ -102,18 +112,16 @@ class MemoryModule(object):
 
         n_queries = query.shape[0]
 
-        # Reshape the tensors for broadcasting and calculate cosine similarity
-        q = query.dimshuffle(0, 'x', 1) # (n_query, 1, key_size)
-        M = self.K.dimshuffle('x', 0, 1) # (1, memory_size, key_size)
-        similarity = T.sum(q*M, axis=2) # (n_query, memory_size)
+        # Because the query and memory keys are aready normalized, cosine
+        # similarity can be calculated through a single matrix multiplication.
+        similarity = T.dot(query, self.K.T) 
 
-        # Find the k-nearest neighbours in terms of cosine similarity.
+        # Find the k-nearest neighbours 
         k_nbrs = T.argsort(similarity, axis=1)[:, ::-1][:, :self.k_nbrs]
-
-        # Index the labels & similarity matrix to get values for each neighbour.
-        # 'repeat' formats a list as: ([0]**n_queries, ... [n-1]*n_queries)
-        idx = T.extra_ops.repeat(T.arange(n_queries), self.k_nbrs)
         k_nbrs_y = self.V[k_nbrs.flatten()].reshape(k_nbrs.shape)
+
+        # Make a pseude row index via repeat
+        idx = T.extra_ops.repeat(T.arange(n_queries), self.k_nbrs)
         k_nbrs_sim = similarity[idx, k_nbrs.flatten()].reshape(k_nbrs.shape)
 
         return k_nbrs, k_nbrs_y, k_nbrs_sim
@@ -159,7 +167,7 @@ class MemoryModule(object):
         neg_loss = T.sum(query*self.K[negative[0]], axis=1)*negative[1]
     
         # Only return the positive components
-        return T.maximum(0, neg_loss - pos_loss + self.alpha)
+        return T.maximum(0, neg_loss - pos_loss + self.alpha) - self.alpha
 
     def _update(self, nbrs, nbrs_y, query, query_y):
         """Builds a graph for performing updates to memory module.
@@ -205,15 +213,11 @@ class MemoryModule(object):
         new_A = T.set_subtensor(new_A[oldest_idx], 0.)
 
         # Increment the age of all non-updated indices by 1
-        #update_mask = T.ones_like(new_A, dtype=theano.config.floatX)
-        #update_mask = T.set_subtensor(update_mask[correct_mem], 0.)
-        #update_mask = T.set_subtensor(update_mask[oldest_idx], 0.)
-        #new_A = new_A + update_mask
         new_A = new_A + 1.
         new_A = T.inc_subtensor(new_A[correct_mem], -1.)
         new_A = T.inc_subtensor(new_A[oldest_idx], -1.)
 
-        return {(self.K, new_K), (self.V, new_V), (self.A, new_A)}
+        return OrderedDict({(self.K, new_K), (self.V, new_V), (self.A, new_A)})
 
     def build_loss_and_updates(self, query, query_y):
         """Builds theano graphs for loss and updates to memory."""
@@ -231,30 +235,31 @@ class MemoryModule(object):
 
     def get_memory(self):
         """Returns the current stored memory."""
-        return self.K.get_value(), self.V.get_value(), self.A.get_value()
+        return (self.K.get_value(), self.V.get_value(), self.A.get_value())
 
-    def set_memory(self, K, V, A):
-        """Sets the current memory."""
-        assert all(s.shape[0] == self.mem_size for s in [K, V, A]), \
-               'Keys, values and ages must all have %d samples.'%self.mem_size
-        if not np.allclose(np.sum(K**2, axis=1), np.ones(K.shape[0])):
-                raise ValueError('The rows of K must be unit norm')
-        self.K.set_value(K)
-        self.V.set_value(V)
-        self.A.set_value(A)
-        
-    def query(self, query):
-        """Queries the memory module for a label to a query."""
+    def query(self, query_in):
+        """Queries the memory module for a label to a sample."""
 
-        # Normalize the query value.
-        normed_query = self._format_query(query)
+        # Make sure all inputs are normalized, so future math holds 
+        normed_query = self._format_query(query_in)
 
-        # Find the labels and similarity of a query vector to memory
         _, labels, similarity = self._neighbours(normed_query)
 
         # Return label of the closest match + softmax over retrieved similarities
         return T.cast(labels[:, 0], 'int32'), T.nnet.softmax(self.t*similarity)
 
+    def set_memory(self, K, V, A):
+        """Sets the current memory."""
+
+        if not  all(s.shape[0] == self.mem_size for s in [K, V, A]):
+            raise ValueError('Memory items must have %d samples.'%self.mem_size)
+        if not np.allclose(np.sum(K**2, axis=1), 1.):
+            raise ValueError('The rows of K must be unit norm')
+
+        self.K.set_value(K)
+        self.V.set_value(V)
+        self.A.set_value(A)
+        
 
 def iterate_minibatches(inputs, targets, batchsize, shuffle=False):
     """Iterates through a minibatch of examples (via Lasagne mnist example)."""
@@ -282,19 +287,19 @@ def main():
 
     # Dataset
     n_features = 30
-    n_samples = 25000
+    n_samples = 2000
 
     # Learning
     batch_size = 50 # Note, also controls age of memory
     num_epochs = 10
 
     # Memory
-    memory_size = 5000
+    memory_size = 500
     key_size = n_features
     k_nbrs = 32
 
     X, y = datasets.make_classification(n_samples=n_samples, n_features=n_features,
-                                        n_informative=5, n_redundant=3,
+                                        n_informative=2, n_redundant=3,
                                         random_state=42, n_classes=2)
 
     X_train, X_val, y_train, y_val = \
@@ -328,12 +333,7 @@ def main():
                                 allow_input_downcast=True)
 
 
-    k, v, a = memory.get_memory()
-    k = norm(k + 1)
-    memory.set_memory(k, v, a)
-    print 'mem[:5]: \n', memory.K.get_value()[:5, :5]
-    print 'k[:5]: \n', k[:5, :5]
-
+    print 'Initial memory: \n', memory.K.get_value()[:10, :10]
     #sys.exit(1)
 
     import time
