@@ -1,6 +1,8 @@
 # Theano implementation of Learning to Remember Rare Events by Kaiser et al. (https://arxiv.org/abs/1703.03129)
 
-Description to come
+The memory module acts as a standalone component to a neural network, and serves as a medium for the network to store and retrieve external information. 
+
+An analogy for this module is to think of it as a differentiable *dictionary*, where the keys of the dictionary are learned by the neural network. These keys represent high-level features of an input, and may be shared across many different inputs (i.e. so long as these features are similar). The values these keys are bound to represent the class labels of a given sample. 
 
 ## Dependencies:
 * Numpy 1.12.1
