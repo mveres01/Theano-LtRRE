@@ -125,7 +125,7 @@ def main():
     key_size = 256
     mem_size = 50*50
     k_nbrs = 128
-    num_epochs = 2
+    num_epochs = 100
     input_var = T.tensor4('x')
     target_var = T.ivector('y')
 
