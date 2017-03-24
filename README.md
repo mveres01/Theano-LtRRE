@@ -17,7 +17,7 @@ python mnist.py
 
 You should see something like:
 
-```python
+```
 Starting training...
 Epoch 1 of 2 took 56.404s
   training loss:                0.042020
