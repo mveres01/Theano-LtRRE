@@ -1,3 +1,5 @@
+"""Main script that defines the memory module."""
+
 from collections import  OrderedDict
 import numpy as np
 import theano
