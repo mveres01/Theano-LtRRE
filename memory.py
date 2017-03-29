@@ -43,7 +43,7 @@ def tensor_choose_k(boolean_mask, rng, k=1, random=False):
         noise = rng.uniform(mask.shape, low=0, high=mask.shape[1])
     else:
         noise = T.arange(mask.shape[1])[::-1] + 1 # Descending order
-        noise = noise.dimshuffle('x', 0)
+        noise = T.cast(noise, theano.config.floatX).dimshuffle('x', 0)
 
     if k == 1:
         return T.argmax(mask*noise, axis=1)
@@ -91,7 +91,7 @@ class MemoryModule(object):
         self.K = theano.shared(K, name='keys')
 
         if V is None:
-            V = np.full(mem_size, -1, dtype='int32')
+            V = np.full(mem_size, -1, dtype=theano.config.floatX)
         self.V = theano.shared(V, name='values')
 
         if A is None:
@@ -108,6 +108,8 @@ class MemoryModule(object):
         # Because the query and memory keys are aready normalized, cosine
         # similarity can be calculated through a single matrix multiplication.
         similarity = T.dot(query, self.K.T)
+
+        cpu_sim = theano.function([query], similarity)
 
         # Find the k-nearest neighbours
         k_nbrs = T.argsort(similarity, axis=1)[:, ::-1][:, :self.k_nbrs]
@@ -216,13 +218,14 @@ class MemoryModule(object):
         """Builds theano graphs for loss and updates to memory."""
 
         normed_query = tensor_format_query(query)
+        query_y_float = T.cast(query_y, theano.config.floatX)
 
         # Find the indices and labels of memory to a query
         nbrs, nbrs_y, _ = self._neighbours(normed_query)
 
         # Build the graph for computing loss and updates to shared memory
-        loss = self._loss(nbrs, nbrs_y, normed_query, query_y)
-        updates = self._update(nbrs, nbrs_y, normed_query, query_y)
+        loss = self._loss(nbrs, nbrs_y, normed_query, query_y_float)
+        updates = self._update(nbrs, nbrs_y, normed_query, query_y_float)
 
         return loss, updates
 
