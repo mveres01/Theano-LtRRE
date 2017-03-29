@@ -49,6 +49,7 @@ def tensor_choose_k(boolean_mask, rng, k=1, random=False):
         return T.argmax(mask*noise, axis=1)
     return T.argsort(mask*noise, axis=1)[:, ::-1][:, :k]
 
+
 def tensor_format_query(query):
     """Convenience function for formatting query vector / matrix."""
 
@@ -108,8 +109,6 @@ class MemoryModule(object):
         # Because the query and memory keys are aready normalized, cosine
         # similarity can be calculated through a single matrix multiplication.
         similarity = T.dot(query, self.K.T)
-
-        cpu_sim = theano.function([query], similarity)
 
         # Find the k-nearest neighbours
         k_nbrs = T.argsort(similarity, axis=1)[:, ::-1][:, :self.k_nbrs]
