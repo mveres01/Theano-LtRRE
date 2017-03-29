@@ -28,3 +28,6 @@ Epoch 2 of 2 took 55.051s
   validation loss:              0.018059
   validation accuracy:          97.65 %
 ```
+
+## Known limitations:
+Due to the dependence of T.argsort for finding the k-nearest neighbours, there is some inefficiency for larger memory sizes (e.g. 10k) due to the entire memory being sorted. Some speedup can likely be achieved either via a theano wrapper to [numpy.argpartition](https://docs.scipy.org/doc/numpy/reference/generated/numpy.argpartition.html), or during training, by calculating the neighbours on the CPU and passing them to the training function. 
